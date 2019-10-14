@@ -1,3 +1,5 @@
+# Author: Roman Sloutsky <sloutsky@wustl.edu>
+
 from topolenum import *
 import subprocess
 from sys import float_info,stderr,argv

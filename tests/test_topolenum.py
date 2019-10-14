@@ -1,3 +1,5 @@
+# Author: Roman Sloutsky <sloutsky@wustl.edu>
+
 import unittest
 import os, os.path
 import time

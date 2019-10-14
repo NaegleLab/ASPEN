@@ -1,3 +1,5 @@
+# Author: Roman Sloutsky <sloutsky@wustl.edu>
+
 import copy
 import weakref
 from collections import Counter

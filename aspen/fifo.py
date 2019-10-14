@@ -1,3 +1,5 @@
+# Author: Roman Sloutsky <sloutsky@wustl.edu>
+
 import os
 import tempfile
 import threading

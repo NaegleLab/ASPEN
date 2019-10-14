@@ -1,3 +1,5 @@
+# Author: Roman Sloutsky <sloutsky@wustl.edu>
+
 import sys
 import time
 import os
