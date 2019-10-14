@@ -1,12 +1,12 @@
 import copy
-from collections import defaultdict
+import weakref
+from collections import Counter
 from functools import wraps
 from StringIO import StringIO
 from Bio import Phylo
-from Bio.SeqRecord import SeqRecord
-from Bio.Seq import Seq
+from Bio.Phylo.BaseTree import Clade
 
-class T(object):
+class T_BASE(object):
   
   def __new__(cls,*args,**kwargs):
     '''
@@ -208,7 +208,7 @@ class T(object):
     elif hasattr(self,'_wrapped_obj') and hasattr(self.wrapped.root,attribute):
       setattr(self._wrapped_obj.root,attribute,value)
     else:
-      super(T,self).__setattr__(attribute,value)
+      super(T_BASE,self).__setattr__(attribute,value)
   
   def __getstate__(self):
     return {'wrapped':self._wrapped_obj,'format':self._format}
@@ -321,3 +321,131 @@ class T(object):
     else:
       Phylo.write(self.wrapped,filepath,format,**kwargs)
 
+
+
+class T(T_BASE):
+  _to_wrappers_map = weakref.WeakValueDictionary()
+  _to_wrapped_map = weakref.WeakValueDictionary()
+  
+  _keep_alive = {}
+  _pickle_counts = Counter()
+  
+  @classmethod
+  def _nsrepr(cls,obj):
+    if obj.is_terminal():
+      return obj.name
+    elif all(c.is_terminal() for c in obj.clades):
+      return frozenset(c.name for c in obj.clades)
+    elif any(c.is_terminal() for c in obj.clades):
+      return frozenset(c.name if c.is_terminal() else
+                       cls._nsrepr(c) for c in obj.clades)
+    else:
+      return frozenset(cls._nsrepr(c) for c in obj.clades)
+  
+  @classmethod
+  def _check_clade(cls,clade_obj):
+    try:
+      assert cls._to_wrapped_map[cls._nsrepr(clade_obj)] is clade_obj
+    except KeyError:
+      assert False,"Unknown non-leaf clade "+repr(cls._nsrepr(clade_obj))
+    except AssertionError:
+      assert False,"Duplicate clade "+repr(cls._nsrepr(clade_obj))
+  
+  def __new__(cls,*args,**kwargs):
+    if 'source' in kwargs:
+      obj = kwargs['source']
+    elif args:
+      obj = args[0]
+    else:
+      return T_BASE.__new__(cls,*args,**kwargs)
+    if hasattr(obj,'is_terminal'):
+      try:
+        cls._check_clade(obj)
+      except AssertionError:
+        print "Caught clade error in __new__"
+        raise
+      obj_to_wrapper_key = id(obj)
+      if obj_to_wrapper_key in cls._to_wrappers_map:
+        return cls._to_wrappers_map[obj_to_wrapper_key]
+      else:
+        new_obj = T_BASE.__new__(cls,*args,**kwargs)
+        cls._to_wrappers_map[obj_to_wrapper_key] = new_obj
+        return new_obj
+    else:
+      return T_BASE.__new__(cls,*args,**kwargs)
+  
+  def _get_spawned(self,item,host=None,format=None):
+    if not hasattr(self,'_spawned') or self._spawned is None:
+      self._spawned = {}
+    id_item = id(item)
+    if id_item not in self._spawned:
+      if not host:
+        host = self._hostObj
+      if not format:
+        format = self._format
+      self._spawned[id_item] = type(self)(item,host,format)
+    return self._spawned[id_item]
+  
+  @classmethod
+  def requisition(cls,clade_def1,clade_def2,*args):
+    new_clades_attr = []
+    for c in (clade_def1,clade_def2)+args:
+      if isinstance(c,str):
+        if c in cls._to_wrapped_map:
+          new_clades_attr.append(cls._to_wrapped_map[c])
+        else:
+          new_leaf = Clade(name=c)
+          cls._to_wrapped_map[c] = new_leaf
+          new_clades_attr.append(new_leaf)
+      else:
+        try:
+          cls._check_clade(c)
+        except AssertionError:
+          print "Caught clade error in requisition()"
+          raise
+        new_clades_attr.append(c)
+    proposed_key = frozenset(cls._nsrepr(c) for c in new_clades_attr)
+    if proposed_key in cls._to_wrapped_map:
+      return cls(cls._to_wrapped_map[proposed_key])
+    else:
+      nonleaf_clade = Clade(clades=new_clades_attr)
+      cls._to_wrapped_map[cls._nsrepr(nonleaf_clade)] = nonleaf_clade
+      return cls(nonleaf_clade)
+  
+  @classmethod
+  def rebuild_on_unpickle(cls,clade_repr,top_level_call=True):
+    if clade_repr in cls._to_wrapped_map:
+      if top_level_call:
+        return cls(cls._to_wrapped_map[clade_repr])
+      else:
+        return cls._to_wrapped_map[clade_repr]
+    elif isinstance(clade_repr,str):
+      leaf = Clade(name=clade_repr)
+      cls._to_wrapped_map[clade_repr] = leaf
+      return leaf
+    if top_level_call:
+      return cls.requisition(*[cls.rebuild_on_unpickle(c_repr,False)
+                               for c_repr in clade_repr])
+    else:
+      return cls.requisition(*[cls.rebuild_on_unpickle(c_repr,False)
+                               for c_repr in clade_repr]).wrapped
+  
+  def check_in_pickle(self):
+    key = self._nsrepr(self._wrapped_obj)
+    if key not in self._keep_alive:
+      assert self._pickle_counts[key] == 0
+      self._keep_alive[key] = self._wrapped_obj
+    self._pickle_counts[key] += 1
+    return key
+  
+  @classmethod
+  def check_out_pickle(cls,key):
+    assert key in cls._pickle_counts and cls._pickle_counts[key] > 0
+    assert key in cls._keep_alive
+    cls._pickle_counts[key] -= 1
+    if cls._pickle_counts[key] == 0:
+      kept_alive = cls._keep_alive.pop(key)
+      cls._pickle_counts.pop(key)
+    else:
+      kept_alive = cls._to_wrapped_map[key]
+    return cls(kept_alive)

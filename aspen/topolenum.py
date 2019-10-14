@@ -3,146 +3,18 @@ import time
 import os
 import math
 import itertools
-import tempfile
-import weakref
 import multiprocessing
-import threading
 import Queue
 import gc
-import cPickle as pickle
+import tarfile
 from cStringIO import StringIO
-from collections import defaultdict,namedtuple,Counter,Hashable
-from Bio.Phylo.BaseTree import Clade
-from .tempdir import TemporaryDirectory
-from .tree import T as T_BASE
+from collections import defaultdict,namedtuple,Hashable
+from .tree import T_BASE,T
+from fifo import FIFOfile,SharedFIFOfile
 
-
-class T(T_BASE):
-  _to_wrappers_map = weakref.WeakValueDictionary()
-  _to_wrapped_map = weakref.WeakValueDictionary()
-  
-  _keep_alive = {}
-  _pickle_counts = Counter()
-  
-  @classmethod
-  def _nsrepr(cls,obj):
-    if obj.is_terminal():
-      return obj.name
-    elif all(c.is_terminal() for c in obj.clades):
-      return frozenset(c.name for c in obj.clades)
-    elif any(c.is_terminal() for c in obj.clades):
-      return frozenset(c.name if c.is_terminal() else
-                       cls._nsrepr(c) for c in obj.clades)
-    else:
-      return frozenset(cls._nsrepr(c) for c in obj.clades)
-  
-  @classmethod
-  def _check_clade(cls,clade_obj):
-    try:
-      assert cls._to_wrapped_map[cls._nsrepr(clade_obj)] is clade_obj
-    except KeyError:
-      assert False,"Unknown non-leaf clade "+repr(cls._nsrepr(clade_obj))
-    except AssertionError:
-      assert False,"Duplicate clade "+repr(cls._nsrepr(clade_obj))
-  
-  def __new__(cls,*args,**kwargs):
-    if 'source' in kwargs:
-      obj = kwargs['source']
-    elif args:
-      obj = args[0]
-    else:
-      return T_BASE.__new__(cls,*args,**kwargs)
-    if hasattr(obj,'is_terminal'):
-      try:
-        cls._check_clade(obj)
-      except AssertionError:
-        print "Caught clade error in __new__"
-        raise
-      obj_to_wrapper_key = id(obj)
-      if obj_to_wrapper_key in cls._to_wrappers_map:
-        return cls._to_wrappers_map[obj_to_wrapper_key]
-      else:
-        new_obj = T_BASE.__new__(cls,*args,**kwargs)
-        cls._to_wrappers_map[obj_to_wrapper_key] = new_obj
-        return new_obj
-    else:
-      return T_BASE.__new__(cls,*args,**kwargs)
-  
-  def _get_spawned(self,item,host=None,format=None):
-    if not hasattr(self,'_spawned') or self._spawned is None:
-      self._spawned = {}
-    id_item = id(item)
-    if id_item not in self._spawned:
-      if not host:
-        host = self._hostObj
-      if not format:
-        format = self._format
-      self._spawned[id_item] = type(self)(item,host,format)
-    return self._spawned[id_item]
-  
-  @classmethod
-  def requisition(cls,clade_def1,clade_def2,*args):
-    new_clades_attr = []
-    for c in (clade_def1,clade_def2)+args:
-      if isinstance(c,str):
-        if c in cls._to_wrapped_map:
-          new_clades_attr.append(cls._to_wrapped_map[c])
-        else:
-          new_leaf = Clade(name=c)
-          cls._to_wrapped_map[c] = new_leaf
-          new_clades_attr.append(new_leaf)
-      else:
-        try:
-          cls._check_clade(c)
-        except AssertionError:
-          print "Caught clade error in requisition()"
-          raise
-        new_clades_attr.append(c)
-    proposed_key = frozenset(cls._nsrepr(c) for c in new_clades_attr)
-    if proposed_key in cls._to_wrapped_map:
-      return cls(cls._to_wrapped_map[proposed_key])
-    else:
-      nonleaf_clade = Clade(clades=new_clades_attr)
-      cls._to_wrapped_map[cls._nsrepr(nonleaf_clade)] = nonleaf_clade
-      return cls(nonleaf_clade)
-  
-  @classmethod
-  def rebuild_on_unpickle(cls,clade_repr,top_level_call=True):
-    if clade_repr in cls._to_wrapped_map:
-      if top_level_call:
-        return cls(cls._to_wrapped_map[clade_repr])
-      else:
-        return cls._to_wrapped_map[clade_repr]
-    elif isinstance(clade_repr,str):
-      leaf = Clade(name=clade_repr)
-      cls._to_wrapped_map[clade_repr] = leaf
-      return leaf
-    if top_level_call:
-      return cls.requisition(*[cls.rebuild_on_unpickle(c_repr,False)
-                               for c_repr in clade_repr])
-    else:
-      return cls.requisition(*[cls.rebuild_on_unpickle(c_repr,False)
-                               for c_repr in clade_repr]).wrapped
-  
-  def check_in_pickle(self):
-    key = self._nsrepr(self._wrapped_obj)
-    if key not in self._keep_alive:
-      assert self._pickle_counts[key] == 0
-      self._keep_alive[key] = self._wrapped_obj
-    self._pickle_counts[key] += 1
-    return key
-  
-  @classmethod
-  def check_out_pickle(cls,key):
-    assert key in cls._pickle_counts and cls._pickle_counts[key] > 0
-    assert key in cls._keep_alive
-    cls._pickle_counts[key] -= 1
-    if cls._pickle_counts[key] == 0:
-      kept_alive = cls._keep_alive.pop(key)
-      cls._pickle_counts.pop(key)
-    else:
-      kept_alive = cls._to_wrapped_map[key]
-    return cls(kept_alive)
+#===============================================================================
+# Topology assembly extension through branching
+#===============================================================================
 
 
 LPDF = namedtuple('LeafPairDistanceFrequency',['leaves','dist','freq'])
@@ -593,7 +465,7 @@ class TreeAssembly(object):
           continue
         # Second filter: is score with extension already worse than min_score?
         if min_score is not None:
-          try: # Will fail is item is a new pair - forgiveness faster than permission
+          try: # Will fail if item is a new pair - forgiveness faster than permission
             if extension.score + self.score < min_score:
               extension_set.pop(key)
               continue
@@ -707,144 +579,12 @@ class TreeAssembly(object):
       return None
 
 
-class FIFOfile(object):
-  class TMPFILE(object):
-    def __new__(cls,*args,**kwargs):
-      cls.instcount += 1
-      return object.__new__(cls,*args,**kwargs)
-    
-    @classmethod
-    def init_class(cls,mode,wbuf,rbuf,suffix,delete,dir,check_delay):
-      cls.mode = mode
-      cls.wbuf = wbuf
-      cls.rbuf = rbuf
-      cls.suffix = suffix
-      cls.delete = delete
-      cls.dir = dir
-      cls.check_delay = check_delay
-      cls.instcount = 0
-    
-    @classmethod
-    def start_spooling(cls):
-      cls.file_spool = []
-    
-    @classmethod
-    def spool(cls):
-      cls.file_spool.append(cls())
-      return cls.file_spool[-1]
-    
-    @classmethod
-    def pop_from_spool(cls):
-      if cls.file_spool:
-        return cls.file_spool.pop(0)
-      else:
-        return None
-    
-    def __init__(self):
-      self.rh = tempfile.NamedTemporaryFile('r'+self.mode,self.rbuf,
-                                            suffix=self.suffix,
-                                            prefix='FIFOfile'+\
-                                            str(self.instcount).zfill(3)+'_',
-                                            dir=self.dir,delete=self.delete)
-      self.name = self.rh.name
-      self._size = 0.0
-      self.access_count_since_size_check = 0
-    
-    @property
-    def size(self):
-      if self.access_count_since_size_check >= self.check_delay:
-        self._size = os.path.getsize(self.name)
-        self.access_count_since_size_check = 0
-      else:
-        self.access_count_since_size_check += 1
-      return self._size
-    
-    def open(self):
-      self.wh = open(self.name,'w'+self.mode,self.wbuf)
-    
-    def close(self):
-      self.wh.close()
-    
-    def discard(self):
-      self.rh.close()
-      assert os.path.exists(self.name) == False
-    
-  
-  def __init__(self,mode='b',wbuffering=0,rbuffering=0,delete=True,top_path='.',
-               suffix='',max_file_size_GB=1.0,size_check_delay=100):
-    self.tmpdir_obj = TemporaryDirectory(dir=top_path,prefix='FIFOworkspace_',
-                                         suffix=suffix)
-    self.max_size = max_file_size_GB*1024**3 #os.path.getsize() reports in bytes
-    self.TMPFILE.init_class(mode,wbuffering,rbuffering,suffix,delete,
-                            os.path.realpath(self.tmpdir_obj.__enter__()),
-                            size_check_delay)
-    
-  def start_OUT_end(self):
-    self.current_reading_file = self.TMPFILE()
-    self.TMPFILE.start_spooling()
-  
-  def start_IN_end(self):
-    self.current_writing_file = self.current_reading_file
-    self.current_writing_file.open()
-  
-  @property
-  def wh(self):
-    if self.current_writing_file.size > self.max_size:
-      self.current_writing_file.close()
-      self.current_writing_file = self.TMPFILE.spool()
-      self.current_writing_file.open()
-    return self.current_writing_file.wh
-  
-  @property
-  def rh(self):
-    old_pos = self.current_reading_file.rh.tell()
-    self.current_reading_file.rh.read(1)
-    if self.current_reading_file.rh.tell() == old_pos: # => cursor is at EOF
-      next_file = self.TMPFILE.pop_from_spool()
-      # We can't check whether the writing handle is closed because it may not
-      # exist in this process. However, if another file is already spooled,
-      # this file must be closed and safe to discard.
-      if next_file is not None:
-        self.current_reading_file.discard()
-        self.current_reading_file = next_file
-        # Need to update old_pos after rolling over
-        old_pos = self.current_reading_file.rh.tell()
-    # If the reading operation successfully advanced the cursor, put it back!
-    # If it didn't, we still want to do the same thing:
-    #
-    # On some platforms performing a read operation when at EOF appears to
-    # put the file handle into a state where further read operations return
-    # nothing and fail to advance the cursor, even after additional writing.
-    # When in this state, calling handle.seek(pos), where pos is the output
-    # of handle.tell() seems to revert the handle to a normal reading state,
-    # fixing the problem.
-    #
-    # If rollover was successful, this will leave the cursor at the top
-    self.current_reading_file.rh.seek(old_pos)
-    return self.current_reading_file.rh
-  
-  def pop(self):
-    try:
-      result = pickle.load(self.rh)
-    except EOFError:
-      result = None
-    return result
-  
-  def push(self,item):
-    pickle.dump(item,self.wh,pickle.HIGHEST_PROTOCOL)
-  
-  def close(self):
-    if self.current_reading_file is self.current_writing_file:
-      assert not self.TMPFILE.file_spool
-      self.current_writing_file.close()
-      self.current_reading_file.discard()
-    else:
-      assert self.current_reading_file.wh.closed
-      self.current_reading_file.discard()
-      for tmpfile in self.TMPFILE.file_spool:
-        tmpfile.close()
-        tmpfile.discard()
-    self.tmpdir_obj.__exit__(None,None,None)
+#===============================================================================
+# Topology enumeration code
+#===============================================================================
+
+#------------------------------------------------------------------------------ 
+# Global tracking of encoutered topology assembly states
 
 
 class CladeReprTracker(object):
@@ -886,6 +626,28 @@ class CladeReprTracker(object):
     else:
       self.encountered.add(csrepr)
       return False
+
+
+class SharedCladeReprTracker(CladeReprTracker):
+  def __init__(self,leaves,shared_dict):
+    self.encountered = shared_dict
+    self.leaves = {leaf:i+1 for i,leaf in enumerate(sorted(leaves))}
+  
+  def already_encountered(self, cladeset):
+    return self.make_str_repr(cladeset) in self.encountered
+  
+  def remember(self,cladeset):
+    self.encountered[self.make_str_repr(cladeset)] = None
+  
+  def forget(self,cladeset):
+    try:
+      self.encountered.pop(self.make_str_repr(cladeset))
+    except KeyError:
+      pass
+
+
+#------------------------------------------------------------------------------ 
+# Classes representing workspace in which topology construction takes place
 
 
 class AssemblyWorkspace(object):
@@ -945,10 +707,10 @@ class AssemblyWorkspace(object):
   
   def apply_acceptance_logic_to_popped_assembly(self,popped,
                                                      rejected_assemblies,
-                                                     counter):
+                                                     counter,no_reject=False):
     if popped[2] > self.curr_min_score:
       self.topoff_count += 1
-      if popped[3] <= self.acceptance_criterion:
+      if popped[3] <= self.acceptance_criterion or no_reject == True:
         uncompressed_assembly = TreeAssembly.uncompress(popped)
         self.log("TopoffAccepted",uncompressed_assembly,best_case=popped[2])
         self.workspace.append(uncompressed_assembly)
@@ -1106,147 +868,18 @@ class AssemblyWorkspace(object):
                                if self.check_completion_status(asbly)
                                                                   is not None])
     for i in drop_from_workspace_idx[::-1]:
-      self.encountered_assemblies.forget(
+      if self.workspace[i] in self.accepted_assemblies:
+        # Don't want to forget an accepted assembly because that can result in
+        # accepting the same assembly twice!
+        self.workspace.pop(i)
+      else:
+        self.encountered_assemblies.forget(
                            self.workspace.pop(i).current_clades_as_nested_sets)
     if interrupt_callable():
       self.prepare_to_terminate()
     else:
       self.finalize_workspace()
     self.iternum += 1
-
-
-class SharedFIFOfile(FIFOfile):
-  class TMPFILE(FIFOfile.TMPFILE):
-    @classmethod
-    def init_class(cls,*args,**kwargs):
-      super(SharedFIFOfile.TMPFILE,cls).init_class(*args,**kwargs)
-      cls.writing_side_conn,cls.reading_side_conn = multiprocessing.Pipe()
-    
-    @classmethod
-    def spool(cls):
-      cls.writing_side_conn.send(None)
-      return cls(cls.writing_side_conn.recv())
-    
-    def __init__(self,filename=None):
-      if filename is None:
-        FIFOfile.TMPFILE.__init__(self)
-      else:
-        self.name = filename
-        self._size = os.path.getsize(filename)
-        self.access_count_since_size_check = 0
-  
-  
-  class SpoolerThread(threading.Thread):
-    def __init__(self,connection,spool_callable,interval_len=1):
-      proc_name = multiprocessing.current_process().name
-      threading.Thread.__init__(self,name='--'.join([proc_name,
-                                                     'TmpfileSpoolerThread']))
-      self.stop = threading.Event()
-      self.connection = connection
-      self.spool = spool_callable
-      self.interval_len = interval_len
-    
-    def run(self):
-      while not self.stop.is_set():
-        if self.connection.poll(self.interval_len):
-          assert self.connection.recv() is None
-          self.connection.send(self.spool().name)
-  
-  
-  def __init__(self,*args,**kwargs):
-    if 'interval_len' in kwargs:
-      self.spooler_polling_interval_len = kwargs.pop('interval_len')
-    else:
-      self.spooler_polling_interval_len = 1
-    FIFOfile.__init__(self,*args,**kwargs)
-    
-    self.lock = multiprocessing.Lock()
-    self.acquire = self.lock.acquire
-    self.release = self.lock.release
-    
-    self.event = multiprocessing.Event()
-    self.set = self.event.set
-    self.is_set = self.event.is_set
-    self.clear = self.event.clear
-    self.wait = self.event.wait
-    
-    self.shutdown_baton = multiprocessing.Condition()
-  
-  def start_OUT_end(self):
-    self.side = 'reading'
-    FIFOfile.start_OUT_end(self)
-    self.TMPFILE.reading_side_conn.send(self.current_reading_file.name)
-    self.spooler = self.SpoolerThread(self.TMPFILE.reading_side_conn,
-                                      super(self.TMPFILE,self.TMPFILE).spool,
-                                      self.spooler_polling_interval_len)
-    self.spooler.start()
-  
-  def start_IN_end(self):
-    self.side = 'writing'
-    self.current_writing_file = self.TMPFILE(self.TMPFILE.writing_side_conn.recv())
-    self.current_writing_file.open()
-    self.shutdown_baton.acquire()
-  
-  def _sync_safe_method_call(self,method,args,already_have_lock=False):
-    if not already_have_lock:
-      with self.lock:
-        return method(self,*args)
-    else:
-      return method(self,*args)
-  
-  def pop(self):
-    self.wait()
-    result = self._sync_safe_method_call(FIFOfile.pop,tuple())
-    if result is None:
-      self.clear()
-    return result
-  
-  def push(self,item,already_have_lock=False):
-    self._sync_safe_method_call(FIFOfile.push,(item,),already_have_lock)
-    if not already_have_lock:
-      self.set()
-  
-  def push_all(self,items):
-    with self.lock:
-      for item in items:
-        self.push(item,already_have_lock=True)
-    self.set()
-  
-  def close(self):
-    if self.side == 'reading':
-      self.spooler.stop.set()
-      self.spooler.join(timeout=10)
-      self.shutdown_baton.acquire()
-      self.current_reading_file.discard()
-      for tmpfile in self.TMPFILE.file_spool:
-        tmpfile.discard()
-      self.shutdown_baton.notify()
-      self.shutdown_baton.release()
-    else:
-      self.current_writing_file.close()
-      self.set() # Free QueueLoader proc from wait in pop() so it can shut down
-      self.shutdown_baton.wait(30)
-      self.tmpdir_obj.__exit__(None,None,None)
-      self.TMPFILE.writing_side_conn.close()
-      self.TMPFILE.reading_side_conn.close()
-
-
-class SharedCladeReprTracker(CladeReprTracker):
-  def __init__(self,leaves,shared_dict):
-    self.encountered = shared_dict
-    self.leaves = {leaf:i+1 for i,leaf in enumerate(sorted(leaves))}
-  
-  def already_encountered(self, cladeset):
-    return self.make_str_repr(cladeset) in self.encountered
-  
-  def remember(self,cladeset):
-    self.encountered[self.make_str_repr(cladeset)] = None
-  
-  def forget(self,cladeset):
-    try:
-      self.encountered.pop(self.make_str_repr(cladeset))
-    except KeyError:
-      pass
 
 
 class WorkerProcAssemblyWorkspace(AssemblyWorkspace):
@@ -1334,12 +967,23 @@ class WorkerProcAssemblyWorkspace(AssemblyWorkspace):
                                        assembly.current_clades_as_nested_sets)
   
   def fill_workspace_from_fifo(self,max_size,rejected_assemblies,counter):
+    no_reject = False
     while len(self.workspace) < max_size and counter[0] < 100:
+      if counter[0] == 99 and self.topoff_count == counter[0]:
+        counter[0] = 0
+        no_reject = True
       try:
         pickled_assembly = self.queue.get_nowait()
       except Queue.Empty:
         if self.workspace:
           break
+        if rejected_assemblies:
+          while rejected_assemblies:
+            self.push_to_fifo((rejected_assemblies.pop(),))
+          self.purge_push_cache()
+          counter[0] = 0
+          no_reject = True
+          time.sleep(5)
         else:
           try:
             pickled_assembly = self.queue.get(timeout=5)
@@ -1350,7 +994,7 @@ class WorkerProcAssemblyWorkspace(AssemblyWorkspace):
               continue
       self.apply_acceptance_logic_to_popped_assembly(pickled_assembly,
                                                      rejected_assemblies,
-                                                     counter)
+                                                     counter,no_reject)
   
   def push_to_fifo(self,push_these):
 #     for item in push_these:
@@ -1384,6 +1028,7 @@ class WorkerProcAssemblyWorkspace(AssemblyWorkspace):
       AssemblyWorkspace.iterate(self,*args,**kwargs)
     except self.AssemblyWorkFinished:
       print >>self.monitor,"Caught 'FINISHED' signal"
+      self.iternum += 1
       return 'FINISHED'
     finally:
       print >>self.monitor,"END OF ITERATION",self.iternum-1,
@@ -1393,30 +1038,137 @@ class WorkerProcAssemblyWorkspace(AssemblyWorkspace):
       gc.collect()
 
 
+#------------------------------------------------------------------------------
+# Process classes which load incomplete assemblies into queue
+
+
 class QueueLoader(multiprocessing.Process):
-  def __init__(self,fifo,close_fifo_EV,queue):
+  def __init__(self,fifo,close_fifo_EV,queue,interrupt,start_loading):
     multiprocessing.Process.__init__(self,name=multiprocessing.current_process().name+'--QueueLoader')
     self.fifo = fifo
     self.close_fifo = close_fifo_EV
     self.queue = queue
+    self.interrupt = interrupt
+    self.start_loading = start_loading
     self.daemon = True
+  
+  def put_in_queue(self,item):
+    while True:
+      try:
+        self.queue.put(item,timeout=5)
+        break
+      except Queue.Full:
+        continue
   
   def run(self):
     self.fifo.start_OUT_end()
+    self.start_loading.wait()
     while not self.close_fifo.is_set():
       popped = self.fifo.pop()
       if popped is None:
-        continue
+        if self.interrupt.is_set():
+          self.put_in_queue('FIFO_EMPTY')
+          break
+        else:
+          continue
       else:
-        while not self.close_fifo.is_set():
-          try:
-            self.queue.put(popped,timeout=5)
-            break
-          except Queue.Full:
-            continue
+        self.put_in_queue(popped)
     self.fifo.close()
     return
 
+
+def RestartQueueReloader_worker_task(stored_string):
+  return RestartQueueReloader.prepare_assembly_state(stored_string,
+                                                   globals()['leaf_name_map'],
+                                                   globals()['dummy_assembly'])
+  
+class RestartQueueReloader(multiprocessing.Process):
+  def __init__(self,restart_from,queue,release_loaders,dummy_assembly,
+                    initial_batch_size=1000,numproc=None):
+    multiprocessing.Process.__init__(self,name='RestartQueueLoader')
+    self.restart_from = restart_from
+    self.queue = queue
+    self.start_workers = multiprocessing.Event()
+    self.release_loaders = release_loaders
+    self.initial_batch_size = initial_batch_size
+    self.dummy_assembly = dummy_assembly
+    self.leaf_name_map = {i+1:leaf for i,leaf in enumerate(sorted(
+                                                dummy_assembly.leaves_master))}
+    self.numproc = numproc
+  
+  @staticmethod
+  def pool_worker_init(leaf_name_map,dummy_assembly):
+    globals()['leaf_name_map'] = leaf_name_map
+    globals()['dummy_assembly'] = dummy_assembly
+  
+  @staticmethod
+  def prepare_assembly_state(stored_string,leaf_name_map,dummy_assembly):
+    built_clades,score,best_case,left_to_build = eval(stored_string)
+    built_clades = [T_BASE(StringIO(c)) for c in built_clades]
+    for c in built_clades:
+      for l in c.get_terminals():
+        l.name = leaf_name_map[eval(l.name)]
+    built_repr = ';'.join(''.join(repr(dummy_assembly.convert_containers(
+                                                 c.nested_set_repr())).split())
+             for c in built_clades)
+    for k,v in dummy_assembly.pickle_encoding.items():
+      built_repr = built_repr.replace(v,k)
+    return built_repr,score,best_case,left_to_build
+  
+  def run(self):
+    with tarfile.open(self.restart_from) as tf:
+      fh = tf.extractfile('./unfinished_assemblies')
+      worker_pool = multiprocessing.Pool(self.numproc,
+                                         initializer=self.pool_worker_init,
+                                         initargs=(self.leaf_name_map,
+                                                   self.dummy_assembly))
+      decoded_assemblies = worker_pool.imap(RestartQueueReloader_worker_task,
+                                            fh)
+      worker_pool.close()
+      for i,prepared_state in enumerate(decoded_assemblies):
+        try:
+          self.queue.put(prepared_state,timeout=5)
+        except Queue.Full:
+          break
+        if i+1 == self.initial_batch_size:
+          break
+      else:
+        self.start_workers.set()
+        self.release_loaders.set()
+        fh.close()
+        return
+      self.start_workers.set()
+      for prepared_state in decoded_assemblies:
+        while True:
+          try:
+            self.queue.put(prepared_state,timeout=5)
+            break
+          except Queue.Full:
+            continue
+      self.release_loaders.set()
+      fh.close()
+      worker_pool.join()
+      return
+
+
+#------------------------------------------------------------------------------ 
+# Process class in which parallelized work takes place
+
+
+class AcceptedAssembly(object):
+  __slots__ = ('score', 'topology')
+  
+  def __init__(self,score=None,topology=None,string_repr=None):
+    if string_repr is not None:
+      score_str,topology = string_repr.split()
+      self.score = float(score_str)
+      self.topology = topology
+    else:
+      self.score = score
+      self.topology = topology.strip()
+  
+  def __repr__(self):
+    return str(self.score)+'\t'+self.topology+'\n'
 
 class AssemblerProcess(multiprocessing.Process):
   def __new__(cls,*args,**kwargs):
@@ -1426,8 +1178,9 @@ class AssemblerProcess(multiprocessing.Process):
     return multiprocessing.Process.__new__(cls,*args,**kwargs)
   
   def __init__(self,queue,shared_encountered_assemblies_dict,shared_min_score,
-                    score_submission_queue,seed_assembly,pass_to_workspace,start_time_val,
-                    results_queue,fifo_max_file_size=1.0):
+                    score_submission_queue,seed_assembly,pass_to_workspace,
+                    start_time_val,results_queue,release_queue_loader,
+                    fifo_max_file_size=1.0):
     multiprocessing.Process.__init__(self,name='AssemblerProcess-'\
                                                  +str(self.instcount).zfill(3))
     
@@ -1444,16 +1197,19 @@ class AssemblerProcess(multiprocessing.Process):
     self.close_fifo = multiprocessing.Event()
     
     self.interrupt = multiprocessing.Event()
+    self.QueueLoader_interrupt = multiprocessing.Event()
     self.finished = multiprocessing.Event()
     self.shutdown = multiprocessing.Event()
+    self.release_queue_loader = release_queue_loader
     self.results_queue = results_queue
   
   def enqueue_results(self):
     for assembly in self.assemblies.accepted_assemblies:
-      self.results_queue.put(assembly)
-    if self.assemblies.workspace:
-      print self.name,"At shutdown assembly workspace has",\
-                      len(self.assemblies.workspace),"in it"
+      accepted = AcceptedAssembly(assembly.score,
+                                  assembly.built_clades[0].write('as_string',
+                                                               format='newick',
+                                                                 plain=True))
+      self.results_queue.put(accepted)
     self.results_queue.put('FINISHED')
   
   def run(self):
@@ -1466,7 +1222,9 @@ class AssemblerProcess(multiprocessing.Process):
                                                   self.start_time,
                                                   *self.pass_to_workspace.args,
                                                   **self.pass_to_workspace.kwargs)
-    self.queue_loader_p = QueueLoader(self.fifo,self.close_fifo,self.queue)
+    self.queue_loader_p = QueueLoader(self.fifo,self.close_fifo,self.queue,
+                                      self.QueueLoader_interrupt,
+                                      self.release_queue_loader)
     self.queue_loader_p.start()
     self.fifo.start_IN_end()
     try:
@@ -1478,6 +1236,7 @@ class AssemblerProcess(multiprocessing.Process):
         if self.interrupt.is_set():
           if not hasattr(self.assemblies,'ready_to_terminate'):
             self.assemblies.prepare_to_terminate()
+          self.QueueLoader_interrupt.set()
           self.fifo.set()
           self.enqueue_results()
           self.shutdown.wait()
@@ -1502,14 +1261,31 @@ class AssemblerProcess(multiprocessing.Process):
     return
 
 
+#------------------------------------------------------------------------------ 
+# Central enumeration process class
+
+
+def unpickle_assembly_for_save(pickled_assembly_state):
+  state = globals()['zeroth_assembly']._unpack_state(pickled_assembly_state)
+  state['built_clades'] = [T.rebuild_on_unpickle(c).write('as_string',
+                                                           format='newick',
+                                                           plain=True)
+                           for c in state['built_clades']]
+  for i,c in enumerate(state['built_clades']):
+    for k,v in globals()['leaf_name_encoding']:
+      c = c.replace(k,str(v))
+    state['built_clades'][i] = c
+  return state
+
+
 class MainTopologyEnumerationProcess(multiprocessing.Process):
   def __init__(self,leafdist_histograms,constraint_freq_cutoff=0.9,
                     absolute_freq_cutoff=0.01,max_workspace_size=10000,
                     max_queue_size=10000,fifo_max_file_size=1.0,
-                    num_requested_topologies=1000,num_workers=1,
-                    save_file_name='early_termination_save',**kwargs):
+                    num_requested_topologies=1000,num_workers=None,
+                    save_file_name='early_termination_save',
+                    restart_from=None,**kwargs):
     multiprocessing.Process.__init__(self)
-    self.save_file_name = save_file_name
     self.assembly_queue_manager = multiprocessing.Manager()
     self.assembly_queue = self.assembly_queue_manager.Queue(max_queue_size)
     self.encountered_assemblies_manager = multiprocessing.Manager()
@@ -1518,7 +1294,9 @@ class MainTopologyEnumerationProcess(multiprocessing.Process):
     self.scores_queue = multiprocessing.Queue()
     self.min_score = multiprocessing.Value('d',-sys.float_info.max)
     self.get_PIDs,self.send_PIDs = multiprocessing.Pipe(duplex=False)
+    self.release_queue_loaders = multiprocessing.Event()
     self.stop = multiprocessing.Event()
+    self.save_written = multiprocessing.Event()
     self.finished = multiprocessing.Event()
     self.shutdown = multiprocessing.Event()
     
@@ -1531,11 +1309,18 @@ class MainTopologyEnumerationProcess(multiprocessing.Process):
     self.max_workspace_size = max_workspace_size
     self.fifo_max_file_size = fifo_max_file_size
     self.num_requested_topologies = num_requested_topologies
-    self.num_workers = num_workers
+    self.num_workers = multiprocessing.cpu_count() if num_workers is None\
+                                                               else num_workers
+    self.expected_number_results_queue_sentinels = self.num_workers
     self.zeroth_assembly = TreeAssembly(self.histograms,
                                         self.constraint_freq_cutoff,
                                         self.leaves,self.absolute_freq_cutoff,
                                         keep_alive_when_pickling=False)
+    self.save_file_name = save_file_name
+    self.restart_from = restart_from
+    if restart_from is not None:
+      self.initial_batch_size = max(int(round(max_queue_size*0.1)),1000)
+      self.expected_number_results_queue_sentinels += 1
     self.kwargs = kwargs
   
   def clean_up(self):
@@ -1548,43 +1333,53 @@ class MainTopologyEnumerationProcess(multiprocessing.Process):
     self.send_PIDs.close()
     self.get_PIDs.close()
   
+  def assemblies_from_queue_generator(self):
+    emptied_FIFO_counter = 0
+    while emptied_FIFO_counter < self.num_workers:
+      try:
+        pickled_assembly_state = self.assembly_queue.get(timeout=5)
+        if pickled_assembly_state == 'FIFO_EMPTY':
+          emptied_FIFO_counter += 1
+        else:
+          yield pickled_assembly_state
+      except Queue.Empty:
+        continue 
+  
+  @staticmethod
+  def pool_assembly_unpickler_worker_init(zeroth_assembly,leaf_name_encoding):
+    globals()['zeroth_assembly'] = zeroth_assembly
+    globals()['leaf_name_encoding'] = leaf_name_encoding.items() 
+  
   def write_save(self):
     leaf_name_encoding = CladeReprTracker(self.leaves).leaves
     reverse_encoding = {v:k for k,v in leaf_name_encoding.items()}
     os.mkdir('tmp_savedir')
     with open('tmp_savedir/leaf_name_encoding','w',0) as wh:
       wh.write(repr(reverse_encoding)+'\n')
+    worker_pool = multiprocessing.Pool(self.num_workers,
+                          initializer=self.pool_assembly_unpickler_worker_init,
+                                       initargs=(self.zeroth_assembly,
+                                                 leaf_name_encoding))
+    assembly_states = worker_pool.imap(unpickle_assembly_for_save,
+                                       self.assemblies_from_queue_generator())
+    worker_pool.close()
     with open('tmp_savedir/unfinished_assemblies','w',0) as wh:
-      while True:
-        try:
-          pickled_assembly_state = self.assembly_queue.get_nowait()
-        except Queue.Empty:
-          print >>sys.stderr,self.name+':',"Got queue empty error, looking into it ...",
-          try:
-            pickled_assembly_state = self.assembly_queue.get(timeout=60)
-            print >>sys.stderr,"fixed after a short wait, continuing"
-          except Queue.Empty:
-            print >>sys.stderr,'\n'+self.name+':',"Got another queue empty error"\
-                               " after 60 second wait, done"
-            break
-        state = self.zeroth_assembly._unpack_state(pickled_assembly_state)
-        state['built_clades'] = [T.rebuild_on_unpickle(c).write('as_string',
-                                                                 format='newick',
-                                                                 plain=True)
-                                 for c in state['built_clades']]
-        for i,c in enumerate(state['built_clades']):
-          for k,v in leaf_name_encoding.items():
-            c = c.replace(k,str(v))
-          state['built_clades'][i] = c
+      for state in assembly_states:
         wh.write(repr((state['built_clades'],round(state['score'],5),
                        round(state['_best_case'],5),
                        state['_nodes_left_to_build'])).replace(' ','')+'\n')
+    worker_pool.join()
     with open('tmp_savedir/encountered_assemblies','w',0) as wh:
-      for assembly_repr in self.encountered_assemblies_dict.keys():
-        wh.write(assembly_repr+'\n')
+      while True:
+        try:
+          assembly_repr,_ = self.encountered_assemblies_dict.popitem()
+          wh.write(assembly_repr+'\n')
+        except KeyError:
+          break
+    
     accepted = []
     finished_worker_counter = 0
-    while finished_worker_counter < self.num_workers:
+    while finished_worker_counter < self.expected_number_results_queue_sentinels:
       received = self.results_queue.get()
       if received == 'FINISHED':
         finished_worker_counter += 1
@@ -1593,14 +1388,13 @@ class MainTopologyEnumerationProcess(multiprocessing.Process):
     accepted.sort(key=lambda x: x.score,reverse=True)
     with open('tmp_savedir/accepted_complete_assemblies','w',0) as wh:
       for assembly in accepted:
-        wh.write(str(assembly.score)+'\t')
-        wh.write(assembly.built_clades[0].write('as_string',format='newick',
-                                                plain=True))
+        wh.write(repr(assembly))
     import shutil
     shutil.make_archive(self.save_file_name,'gztar','tmp_savedir')
     shutil.rmtree('tmp_savedir')
   
-  def run(self):
+  def set_up_initial_run(self,workspace_args):
+    self.release_queue_loaders.set()
     seed_assemblies = [self.zeroth_assembly]
     while len(seed_assemblies) < self.num_workers:
       seed_assemblies = [a for old_a in seed_assemblies
@@ -1608,25 +1402,87 @@ class MainTopologyEnumerationProcess(multiprocessing.Process):
                                   SharedCladeReprTracker(self.leaves,
                                             self.encountered_assemblies_dict))]
     seed_assemblies.sort(key=lambda a: a.sort_key)
+    procs = [AssemblerProcess(self.assembly_queue,
+                              self.encountered_assemblies_dict,
+                              self.min_score,self.scores_queue,
+                              seed_assemblies.pop(),workspace_args,
+                              self.start_time,self.results_queue,
+                              self.release_queue_loaders,
+                              self.fifo_max_file_size)
+             for i in xrange(self.num_workers)]
+    while seed_assemblies:
+      self.assembly_queue.put(seed_assemblies.pop().compress())
+    self.accepted_scores = []
+    return procs
+  
+  def set_up_restarted_run(self,workspace_args):
+    self.restart_queue_loader = RestartQueueReloader(self.restart_from,
+                                                     self.assembly_queue,
+                                                     self.release_queue_loaders,
+                                                     self.zeroth_assembly,
+                                                     self.initial_batch_size,
+                                                     self.num_workers)
+    self.restart_queue_loader.start()
+    with tarfile.open(self.restart_from) as tf:
+      fh = tf.extractfile('./accepted_complete_assemblies')
+      self.previously_accepted_assemblies = []
+      for l in fh:
+        self.previously_accepted_assemblies.append(
+                                               AcceptedAssembly(string_repr=l))
+      self.previously_accepted_assemblies.sort(key=lambda x: x.score,
+                                               reverse=True)
+      self.accepted_scores = [a.score
+                                  for a in self.previously_accepted_assemblies]
+      while len(self.accepted_scores) > self.num_requested_topologies:
+        self.accepted_scores.pop()
+        self.previously_accepted_assemblies.pop()
+      if len(self.accepted_scores) == self.num_requested_topologies:
+        self.min_score.value = self.accepted_scores[-1]
+      fh.close()
+      for assembly in self.previously_accepted_assemblies:
+        self.results_queue.put(assembly)
+      self.results_queue.put('FINISHED')
+      fh = tf.extractfile('./leaf_name_encoding')
+      reverse_leaf_map = {v:k for k,v in CladeReprTracker(self.leaves).leaves.items()}
+      assert eval(fh.read()) == reverse_leaf_map
+      fh.close()
+      fh = tf.extractfile('./encountered_assemblies')
+      for l in fh:
+        self.encountered_assemblies_dict[l.strip()] = None
+      fh.close()
+    self.restart_queue_loader.start_workers.wait()
+    procs = [AssemblerProcess(self.assembly_queue,
+                              self.encountered_assemblies_dict,
+                              self.min_score,self.scores_queue,
+                              TreeAssembly.uncompress(self.assembly_queue.get()),
+                              workspace_args,
+                              self.start_time,self.results_queue,
+                              self.release_queue_loaders,
+                              self.fifo_max_file_size)
+             for i in xrange(self.num_workers)]
+    return procs
+  
+  def run(self):
     self.kwargs.update({'num_requested_trees':self.num_requested_topologies,
                         'max_workspace_size':self.max_workspace_size})
     workspace_args = namedtuple('ArgsKwargs',
                                 ['args','kwargs'])((self.leaves,),self.kwargs)
-    self.accepted_scores = []
     try:
-      procs = [AssemblerProcess(self.assembly_queue,
-                                self.encountered_assemblies_dict,
-                                self.min_score,self.scores_queue,
-                                seed_assemblies.pop(),workspace_args,self.start_time,
-                                self.results_queue,self.fifo_max_file_size)
-               for i in xrange(self.num_workers)]
-      while seed_assemblies:
-        self.assembly_queue.put(seed_assemblies.pop().compress())
-      for p in procs:
+      if self.restart_from is not None:
+        self.procs = self.set_up_restarted_run(workspace_args)
+      else:
+        self.procs = self.set_up_initial_run(workspace_args)
+      for p in self.procs:
         p.start()
         self.send_PIDs.send((p.pid,p.name))
       
-      while any(not p.finished.is_set() for p in procs):
+      while any(not p.finished.is_set() for p in self.procs):
+        if self.stop.is_set():
+          for p in self.procs:
+            p.interrupt.set()
+          self.write_save()
+          self.save_written.set()
+          break
         try:
           proposed_score = self.scores_queue.get(timeout=0.05)
           if len(self.accepted_scores) < self.num_requested_topologies\
@@ -1637,169 +1493,33 @@ class MainTopologyEnumerationProcess(multiprocessing.Process):
               self.accepted_scores.pop()
             if len(self.accepted_scores) == self.num_requested_topologies:
               self.min_score.value = self.accepted_scores[-1]
-          if self.stop.is_set():
-            for p in procs:
-              p.interrupt.set()
-            self.write_save()
-            break
         except Queue.Empty:
           continue
       
-      for p in procs:
+      for p in self.procs:
         p.shutdown.set()
       
       self.finished.set()
       while not self.shutdown.wait(1):
         continue
-      
-      for p in procs:
+      for p in self.procs:
         p.join(timeout=10)
         if p.is_alive():
           p.terminate()
+          p.join()
+      if hasattr(self,'restart_queue_loader'):
+        self.restart_queue_loader.join(timeout=10)
+        if self.restart_queue_loader.is_alive():
+          self.restart_queue_loader.terminate()
+          self.restart_queue_loader.join()
     
     except Exception:
-      for p in procs:
-        p.shutdown.set()
-        p.join(timeout=15)
-        if p.is_alive():
-          p.terminate()
+      if hasattr(self,'procs'):
+        for p in self.procs:
+          p.shutdown.set()
+          p.join(timeout=15)
+          if p.is_alive():
+            p.terminate()
+            p.join()
       raise
-
-
-import subprocess
-from sys import float_info,stderr
-
-
-class EnumerationObserver(object):
-  ONE_HOUR = 3600
-  SIX_HOURS = 21600
-  
-  def __init__(self,terminator_file='stop_enumeration',
-               timestamp_frequency=ONE_HOUR,
-               username_for_top=None,report_frequency=SIX_HOURS,
-               report_on_workers=False):
-    self.terminator = terminator_file
-    self.timestamp_freq = timestamp_frequency
-    self.username = username_for_top
-    self.report_freq = report_frequency
-    self.report_on_workers = report_on_workers
-    self.old_min_score = -float_info.max
-    
-    self.start_time = time.time()
-    self.time_of_last_stamp = self.start_time
-    self.time_of_last_report = self.start_time
-    
-    self.first_call = True
-  
-  def time_since(self,time_in_past):
-    return time.time()-time_in_past
-  
-  @property
-  def total_elapsed_time(self):
-    return self.time_since(self.start_time)
-  
-  @property
-  def timestamp(self):
-    stamp = ''
-    seconds = self.total_elapsed_time
-    true_seconds = seconds
-    if true_seconds >= 86400:
-      stamp += '%0.0fd:' %  ((seconds - seconds % 86400) / 86400)
-      seconds = seconds % 86400
-    if true_seconds >= 3600:
-      stamp += '%0.0fh:' %  ((seconds - seconds % 3600) / 3600)
-      seconds = seconds % 3600
-    if true_seconds >= 60:
-      stamp += '%0.0fm:' %  ((seconds - seconds % 60) / 60)
-      seconds = seconds % 60
-    stamp += '%0.0fs\t  ' % seconds
-    return stamp
-  
-  def report_timestamp(self):
-    print >>stderr,self.timestamp,"Elapsed since start"
-    self.time_of_last_stamp = time.time()
-
-  def report_top_output(self,enum_proc,workers=None):
-    self.dict_proc_PID = enum_proc.encountered_assemblies_manager._process.pid
-    self.queue_proc_PID = enum_proc.assembly_queue_manager._process.pid
-    print >>stderr,'='*80
-    subprocess.call('top -n 1 -b | grep PID',shell=True)
-    print >>stderr,'-'*31+'Shared Dict Process'+'-'*30
-    grep_this = '"'+str(self.dict_proc_PID)+' %s"' % self.username
-    subprocess.call('top -n 1 -u %s -b | grep ' % self.username + grep_this,
-                    shell=True)
-    if workers is not None:
-      print >>stderr,'-'*32+'Worker Processes'+'-'*32
-      proc_PIDs = workers.keys() + [self.queue_proc_PID,self.dict_proc_PID]
-      proc_args = ' '.join(['-p'+str(pid) for pid in proc_PIDs])
-      subprocess.call('top -n 1 '+proc_args+' -b | grep %s' % self.username,
-                      shell=True)
-    print >>stderr,'~'*80
-    self.time_of_last_report = time.time()
-  
-  def report_score(self,enum_proc):
-    if enum_proc.min_score.value > self.old_min_score:
-      self.old_min_score = enum_proc.min_score.value
-      print >>stderr,self.timestamp,"New worst score is",self.old_min_score
-  
-  def proceed_permission_check(self):
-    if self.terminator in os.listdir('.'):
-      os.remove(self.terminator)
-      return False
-    else:
-      return True
-    
-  
-  def __call__(self,enum_proc,workers):
-    if self.time_since(self.time_of_last_stamp) > self.timestamp_freq:
-      self.report_timestamp()
-    if self.first_call or\
-                  self.time_since(self.time_of_last_report) > self.report_freq:
-      if self.username is not None:
-        if self.report_on_workers:
-          self.report_top_output(enum_proc,workers)
-        else:
-          self.report_top_output(enum_proc)
-        self.first_call = False
-    self.report_score(enum_proc)
-
-
-def enumerate_topologies(leafdist_histograms,
-                         proceed_permission_callable=lambda: True,
-                         wait_duration=10,observer_callable=None,**kwargs):
-  enumeration_proc = MainTopologyEnumerationProcess(leafdist_histograms,
-                                                    **kwargs)
-  enumeration_proc.start()
-  workers = {}
-  while len(workers) < enumeration_proc.num_workers:
-    if enumeration_proc.get_PIDs.poll(1):
-      new_worker = enumeration_proc.get_PIDs.recv()
-      workers[new_worker[0]] = new_worker[1]
-  
-  while not enumeration_proc.finished.wait(wait_duration):
-    if observer_callable is not None:
-      observer_callable(enumeration_proc,workers)
-    if not proceed_permission_callable():
-      enumeration_proc.stop.set()
-      break
-  
-  if enumeration_proc.stop.is_set():
-    results = None
-  elif enumeration_proc.finished.is_set():
-    results = []
-    finished_worker_counter = 0
-    while finished_worker_counter < enumeration_proc.num_workers:
-      received = enumeration_proc.results_queue.get()
-      if received == 'FINISHED':
-        finished_worker_counter += 1
-      else:
-        results.append(received)
-    results.sort(key=lambda x: x.score,reverse=True)
-    while len(results) > enumeration_proc.num_requested_topologies:
-      results.pop()
-  enumeration_proc.shutdown.set()
-  enumeration_proc.join()
-  enumeration_proc.clean_up()
-  
-  return results
 
