@@ -1,7 +1,7 @@
 # ASPEN
 
 ## Summary
-Topology reconstruction by enumeration using branch-and-bound, as described in the 2019 publication *`Publication information to come`*. ASPEN enumeration 
+Topology reconstruction by enumeration using branch-and-bound, as described in the 2019 publication *`Publication information to come`*.
 
 ### Note about parallelization
 Although in some cases enumeration can be done effectively on one core, this code is set up for parallel reconstruction. Because there is some overhead to setting up the parallelization framework, this code actually runs less efficiently on one core. We recommend using at least 4 worker processes to take full advantage of the parallelization.
