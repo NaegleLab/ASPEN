@@ -1,7 +1,8 @@
 # Author: Roman Sloutsky <sloutsky@wustl.edu>
 
 import unittest
-import os, os.path
+import os
+import threading
 import time
 import cPickle as pickle
 from cStringIO import StringIO
@@ -14,8 +15,8 @@ from aspen import topolenum as te
 class TestFIFOfileBaseClassTMPFILEclass(unittest.TestCase):
   
   def setUp(self):
-    reload(te)
-    self.TMPFILE = te.FIFOfile.TMPFILE
+    reload(te.fifo)
+    self.TMPFILE = te.fifo.FIFOfile.TMPFILE
     self.TMPFILE.init_class(mode='b',wbuf=0,rbuf=0,suffix='',delete=True,
                             dir='/dummy/path',check_delay=5)
   
@@ -79,19 +80,20 @@ class TestFIFOfileBaseClassTMPFILEclass(unittest.TestCase):
 
 @patch('os.path.exists',return_value=False)
 @patch('os.path.realpath',return_value='/dummy/path')
-@patch('aspen.topolenum.TemporaryDirectory')
+@patch('aspen.fifo.TemporaryDirectory')
 @patch('tempfile.NamedTemporaryFile',**{'return_value.name':'dummy_temp_file'})
 class TestFIFOfileBaseClass(unittest.TestCase):
   
   def setUp(self):
-    reload(te)
+    reload(te.fifo)
   
-  @patch('aspen.topolenum.FIFOfile.TMPFILE.init_class')
+  @patch('aspen.topolenum.fifo.FIFOfile.TMPFILE.init_class')
   def test_tmpdir_creation_and_TMPFILE_class_init(self,patched_TMPFILE_initcls,
                                                   patched_NTF,patched_TmpDir,
                                                   patched_realpath,
                                                   patched_exists):
-    fifo_obj = te.FIFOfile(top_path='/dummy/top/path/arg',suffix='dummy_suffix')
+    fifo_obj = te.fifo.FIFOfile(top_path='/dummy/top/path/arg',
+                                suffix='dummy_suffix')
     patched_TmpDir.assert_called_once_with(dir='/dummy/top/path/arg',
                                            prefix='FIFOworkspace_',
                                            suffix='dummy_suffix')
@@ -99,19 +101,19 @@ class TestFIFOfileBaseClass(unittest.TestCase):
                                                     '/dummy/path',100)
   
   def test_starting_fifo_OUT_end(self,patched_NTF,*args):
-    fifo_obj = te.FIFOfile()
-    self.assertFalse(hasattr(te.FIFOfile.TMPFILE,'file_spool'))
+    fifo_obj = te.fifo.FIFOfile()
+    self.assertFalse(hasattr(te.fifo.FIFOfile.TMPFILE,'file_spool'))
     patched_NTF.assert_not_called()
     self.assertFalse(hasattr(fifo_obj,'current_reading_file'))
     
     fifo_obj.start_OUT_end()
     patched_NTF.assert_called_once_with('rb',0,suffix='',prefix='FIFOfile001_',
                                         dir='/dummy/path',delete=True)
-    self.assertSequenceEqual(te.FIFOfile.TMPFILE.file_spool,[],seq_type=list)
+    self.assertSequenceEqual(te.fifo.FIFOfile.TMPFILE.file_spool,[],seq_type=list)
     self.assertEqual(fifo_obj.current_reading_file.name,'dummy_temp_file')
   
   def test_starting_fifo_IN_end(self,*args):
-    fifo_obj = te.FIFOfile()
+    fifo_obj = te.fifo.FIFOfile()
     self.assertFalse(hasattr(fifo_obj,'current_writing_file'))
     
     fifo_obj.start_OUT_end()
@@ -141,7 +143,7 @@ class TestFIFOfileBaseClass(unittest.TestCase):
     
     # Start up FIFO and clear out calls to mocks
     # 0.001*1024^3 ~= 1073.7, 500.0 < 1073.7 < 1100.0, perfect!
-    fifo_obj = te.FIFOfile(max_file_size_GB=0.000001,size_check_delay=2)
+    fifo_obj = te.fifo.FIFOfile(max_file_size_GB=0.000001,size_check_delay=2)
     fifo_obj.start_OUT_end()
     fifo_obj.start_IN_end()
     patched_NTF.reset_mock()
@@ -193,7 +195,7 @@ class TestFIFOfileBaseClass(unittest.TestCase):
     patched_NTF.side_effect = patched_NTF_side_effect
     
     # Start up FIFO
-    fifo_obj = te.FIFOfile()
+    fifo_obj = te.fifo.FIFOfile()
     fifo_obj.start_OUT_end()
     with patch('__builtin__.open',mock_open(),create=True):
       fifo_obj.start_IN_end()
@@ -238,12 +240,12 @@ class TestFIFOfileBaseClass(unittest.TestCase):
   
   def test_FIFO_pop(self,patched_NTF,patched_TmpDir,patched_realpath,
                     patched_exists):
-    with patch.object(te.FIFOfile,'rh',PropertyMock(side_effect=\
+    with patch.object(te.fifo.FIFOfile,'rh',PropertyMock(side_effect=\
                         [StringIO(pickle.dumps('data1',protocol=2)),
                          StringIO(''),
                          StringIO(pickle.dumps('data2',protocol=2))]))\
                                                                 as patched_rh:
-      fifo_obj = te.FIFOfile()
+      fifo_obj = te.fifo.FIFOfile()
       fifo_obj.start_OUT_end()
       self.assertEqual(fifo_obj.pop(),'data1')
       self.assertEqual(fifo_obj.pop(),None)
@@ -253,7 +255,7 @@ class TestFIFOfileBaseClass(unittest.TestCase):
   def test_FIFO_close(self,patched_open,patched_NTF,patched_TmpDir,
                       patched_realpath,patched_exists):
     # Simple case: one temp file, spool is empty
-    fifo_obj = te.FIFOfile()
+    fifo_obj = te.fifo.FIFOfile()
     fifo_obj.start_OUT_end()
     fifo_obj.start_IN_end()
     
@@ -285,7 +287,7 @@ class TestFIFOfileBaseClass(unittest.TestCase):
     patched_open.side_effect = patched_open_side_effect
     
     # Alternative: reading and writing files are different, spool not empty
-    fifo_obj = te.FIFOfile()
+    fifo_obj = te.fifo.FIFOfile()
     fifo_obj.start_OUT_end()
     fifo_obj.start_IN_end()
     fifo_obj.current_writing_file.close()
@@ -320,8 +322,8 @@ class TestFIFOfileBaseClass(unittest.TestCase):
 class TestFIFOfile_and_TMPFILE_and_system_integration(unittest.TestCase):
   
   def setUp(self):
-    reload(te)
-    self.fifo_obj = te.FIFOfile(top_path=None, # Let os decide where to put tempdir
+    reload(te.fifo)
+    self.fifo_obj = te.fifo.FIFOfile(top_path=None, # Let os decide where to put tempdir
                                 # 1.7695128917694092e-08 GB * 1024^4 B/GB = 19.0 B
                                 max_file_size_GB=1.7695128917694092e-08,
                                 size_check_delay=0) # Check file size every time
@@ -464,8 +466,8 @@ class TestFIFOfile_and_TMPFILE_and_system_integration(unittest.TestCase):
 class TestSharedFIFOfileClassTMPFILEClass(unittest.TestCase):
    
   def setUp(self):
-    reload(te)
-    self.TMPFILE = te.SharedFIFOfile.TMPFILE
+    reload(te.fifo)
+    self.TMPFILE = te.fifo.SharedFIFOfile.TMPFILE
     self.TMPFILE.init_class(mode='b',wbuf=0,rbuf=0,suffix='',delete=True,
                             dir='/dummy/path',check_delay=0)
    
@@ -479,7 +481,7 @@ class TestSharedFIFOfileClassTMPFILEClass(unittest.TestCase):
     self.assertIs(tempfile_obj._size,patched_getsize.return_value)
     self.assertEqual(tempfile_obj.access_count_since_size_check,0)
   
-  @patch('aspen.topolenum.FIFOfile.TMPFILE.__init__')
+  @patch('aspen.topolenum.fifo.FIFOfile.TMPFILE.__init__')
   def test_reading_side_init(self,patched_TMPFILE_init):
     tempfile_obj = self.TMPFILE()
     patched_TMPFILE_init.assert_called_once_with(tempfile_obj)
@@ -488,22 +490,22 @@ class TestSharedFIFOfileClassTMPFILEClass(unittest.TestCase):
 class TestSharedFIFOfileClassSpoolerThreadClass(unittest.TestCase):
   
   def setUp(self):
-    reload(te)
+    reload(te.fifo)
     self.writing_end_conn,self.reading_end_conn = te.multiprocessing.Pipe()
     self.mock_spool_callable = Mock()
     self.tmpfile_name_mock_property = \
                               PropertyMock(return_value='dummy_tempfile_name')
     type(self.mock_spool_callable.return_value).name = \
                                                 self.tmpfile_name_mock_property
-    self.spooler = te.SharedFIFOfile.SpoolerThread(self.reading_end_conn,
-                                                   self.mock_spool_callable,
-                                                   interval_len=0.01)
+    self.spooler = te.fifo.SharedFIFOfile.SpoolerThread(self.reading_end_conn,
+                                                        self.mock_spool_callable,
+                                                        interval_len=0.01)
   
   def test_SpoolerThread(self):
     self.assertEqual(self.spooler.name,'MainProcess--TmpfileSpoolerThread')
-    self.assertEqual(len(te.threading.enumerate()),1)
+    self.assertEqual(len(threading.enumerate()),1)
     self.spooler.start()
-    self.assertEqual(len(te.threading.enumerate()),2)
+    self.assertEqual(len(threading.enumerate()),2)
     self.assertFalse(self.writing_end_conn.poll())
     self.assertFalse(self.mock_spool_callable.called)
     self.assertFalse(self.tmpfile_name_mock_property.called)
@@ -521,33 +523,35 @@ class TestSharedFIFOfileClassSpoolerThreadClass(unittest.TestCase):
 
 @patch('os.path.exists',return_value=False)
 @patch('os.path.realpath',return_value='/dummy/path')
-@patch('aspen.topolenum.TemporaryDirectory')
+@patch('aspen.fifo.TemporaryDirectory')
 @patch('tempfile.NamedTemporaryFile',**{'return_value.name':'dummy_temp_file'})
 class TestSharedFIFOfileClass(unittest.TestCase):
   
   def setUp(self):
-    reload(te)
+    reload(te.fifo)
   
   def test_TMPFILE_class_init_w_conns(self,*args):
-    self.assertFalse(hasattr(te.SharedFIFOfile.TMPFILE,'instcount'))
-    self.assertFalse(hasattr(te.SharedFIFOfile.TMPFILE,'writing_side_conn'))
-    self.assertFalse(hasattr(te.SharedFIFOfile.TMPFILE,'reading_side_conn'))
+    self.assertFalse(hasattr(te.fifo.SharedFIFOfile.TMPFILE,'instcount'))
+    self.assertFalse(hasattr(te.fifo.SharedFIFOfile.TMPFILE,'writing_side_conn'))
+    self.assertFalse(hasattr(te.fifo.SharedFIFOfile.TMPFILE,'reading_side_conn'))
     
-    fifo_obj = te.SharedFIFOfile()
-    self.assertTrue(hasattr(te.SharedFIFOfile.TMPFILE,'instcount'))
-    self.assertTrue(hasattr(te.SharedFIFOfile.TMPFILE,'writing_side_conn'))
-    self.assertTrue(hasattr(te.SharedFIFOfile.TMPFILE,'reading_side_conn'))
+    fifo_obj = te.fifo.SharedFIFOfile()
+    self.assertTrue(hasattr(te.fifo.SharedFIFOfile.TMPFILE,'instcount'))
+    self.assertTrue(hasattr(te.fifo.SharedFIFOfile.TMPFILE,'writing_side_conn'))
+    self.assertTrue(hasattr(te.fifo.SharedFIFOfile.TMPFILE,'reading_side_conn'))
     
-    te.SharedFIFOfile.TMPFILE.writing_side_conn.send('test_packet1')
-    self.assertEqual(te.SharedFIFOfile.TMPFILE.reading_side_conn.recv(),'test_packet1')
-    te.SharedFIFOfile.TMPFILE.reading_side_conn.send('test_packet2')
-    self.assertEqual(te.SharedFIFOfile.TMPFILE.writing_side_conn.recv(),'test_packet2')
+    te.fifo.SharedFIFOfile.TMPFILE.writing_side_conn.send('test_packet1')
+    self.assertEqual(te.fifo.SharedFIFOfile.TMPFILE.reading_side_conn.recv(),
+                     'test_packet1')
+    te.fifo.SharedFIFOfile.TMPFILE.reading_side_conn.send('test_packet2')
+    self.assertEqual(te.fifo.SharedFIFOfile.TMPFILE.writing_side_conn.recv(),
+                     'test_packet2')
   
   def test_starting_fifo_OUT_end(self,patched_NTF,*args):
-    self.assertFalse(hasattr(te.SharedFIFOfile.TMPFILE,'file_spool'))
-    self.assertEqual(len(te.threading.enumerate()),1)
+    self.assertFalse(hasattr(te.fifo.SharedFIFOfile.TMPFILE,'file_spool'))
+    self.assertEqual(len(threading.enumerate()),1)
     
-    self.fifo_obj = te.SharedFIFOfile(interval_len=0.01)
+    self.fifo_obj = te.fifo.SharedFIFOfile(interval_len=0.01)
     self.assertFalse(hasattr(self.fifo_obj,'side'))
     self.assertFalse(hasattr(self.fifo_obj,'current_reading_file'))
     self.assertFalse(hasattr(self.fifo_obj,'current_writing_file'))
@@ -565,23 +569,24 @@ class TestSharedFIFOfileClass(unittest.TestCase):
                   patched_NTF.return_value)
     self.assertIs(self.fifo_obj.current_reading_file.rh.name,'dummy_temp_file')
     
-    self.assertTrue(hasattr(te.SharedFIFOfile.TMPFILE,'file_spool'))
-    self.assertSequenceEqual(te.SharedFIFOfile.TMPFILE.file_spool,[])
+    self.assertTrue(hasattr(te.fifo.SharedFIFOfile.TMPFILE,'file_spool'))
+    self.assertSequenceEqual(te.fifo.SharedFIFOfile.TMPFILE.file_spool,[])
     
-    self.assertTrue(te.SharedFIFOfile.TMPFILE.writing_side_conn.poll())
-    self.assertEqual(te.SharedFIFOfile.TMPFILE.writing_side_conn.recv(),'dummy_temp_file')
-    self.assertEqual(len(te.threading.enumerate()),2)
+    self.assertTrue(te.fifo.SharedFIFOfile.TMPFILE.writing_side_conn.poll())
+    self.assertEqual(te.fifo.SharedFIFOfile.TMPFILE.writing_side_conn.recv(),
+                     'dummy_temp_file')
+    self.assertEqual(len(threading.enumerate()),2)
     self.assertTrue(hasattr(self.fifo_obj,'spooler'))
     self.assertTrue(self.fifo_obj.spooler.is_alive())
   
   @patch('os.path.getsize',return_value=100)
   def test_starting_fifo_IN_end(self,patched_getsize,*args):
-    self.fifo_obj = te.SharedFIFOfile(interval_len=0.01)
+    self.fifo_obj = te.fifo.SharedFIFOfile(interval_len=0.01)
     self.assertFalse(hasattr(self.fifo_obj,'side'))
     self.assertFalse(hasattr(self.fifo_obj,'current_reading_file'))
     self.assertFalse(hasattr(self.fifo_obj,'current_writing_file'))
     
-    te.SharedFIFOfile.TMPFILE.reading_side_conn.send('dummy_temp_file')
+    te.fifo.SharedFIFOfile.TMPFILE.reading_side_conn.send('dummy_temp_file')
     with patch('__builtin__.open',mock_open(),create=True) as patched_open:
       self.fifo_obj.start_IN_end()
     
@@ -628,8 +633,8 @@ class TestSharedFIFOfileClass(unittest.TestCase):
           pass
         self.fifo_obj.close()
     
-    self.fifo_obj = te.SharedFIFOfile(max_file_size_GB=0.000001,
-                                      size_check_delay=1,interval_len=0.01)
+    self.fifo_obj = te.fifo.SharedFIFOfile(max_file_size_GB=0.000001,
+                                           size_check_delay=1,interval_len=0.01)
     self.shutdown_EV = te.multiprocessing.Event()
     self.other_proc = TesterProc(self.fifo_obj,self.shutdown_EV)
     self.other_proc.start()
@@ -690,8 +695,8 @@ class TestSharedFIFOfileClass(unittest.TestCase):
           pass
         self.fifo_obj.close()
     
-    self.fifo_obj = te.SharedFIFOfile(max_file_size_GB=0.000001,
-                                      size_check_delay=0,interval_len=0.01)
+    self.fifo_obj = te.fifo.SharedFIFOfile(max_file_size_GB=0.000001,
+                                           size_check_delay=0,interval_len=0.01)
     self.shutdown_EV = te.multiprocessing.Event()
     ask_for_file_EV = te.multiprocessing.Event()
     self.other_proc = TesterProc(self.fifo_obj,ask_for_file_EV,self.shutdown_EV)
@@ -733,7 +738,7 @@ class TestSharedFIFOfileClass(unittest.TestCase):
           pass
         self.fifo_obj.close()
     
-    self.fifo_obj = te.SharedFIFOfile(interval_len=0.01)
+    self.fifo_obj = te.fifo.SharedFIFOfile(interval_len=0.01)
     self.shutdown_EV = te.multiprocessing.Event()
     self.other_proc = TesterProc(self.fifo_obj,self.shutdown_EV)
     self.other_proc.start()
@@ -746,16 +751,16 @@ class TestSharedFIFOfileClass(unittest.TestCase):
     self.assertFalse(patched_open.return_value.close.called)
     self.assertFalse(patched_Condition.instance.wait.called)
     self.assertFalse(patched_TmpDir.return_value.__exit__.called)
-    self.assertFalse(te.SharedFIFOfile.TMPFILE.writing_side_conn.closed)
-    self.assertFalse(te.SharedFIFOfile.TMPFILE.reading_side_conn.closed)
+    self.assertFalse(te.fifo.SharedFIFOfile.TMPFILE.writing_side_conn.closed)
+    self.assertFalse(te.fifo.SharedFIFOfile.TMPFILE.reading_side_conn.closed)
     
     self.fifo_obj.close()
     patched_open.return_value.close.assert_called_once_with()
     patched_Condition.instance.wait.assert_called_once_with(30)
     patched_TmpDir.return_value.__exit__.assert_called_once_with(None,
                                                                  None,None)
-    self.assertTrue(te.SharedFIFOfile.TMPFILE.writing_side_conn.closed)
-    self.assertTrue(te.SharedFIFOfile.TMPFILE.reading_side_conn.closed)
+    self.assertTrue(te.fifo.SharedFIFOfile.TMPFILE.writing_side_conn.closed)
+    self.assertTrue(te.fifo.SharedFIFOfile.TMPFILE.reading_side_conn.closed)
     self.other_proc.join()
   
   @patch('os.path.getsize')
@@ -786,7 +791,7 @@ class TestSharedFIFOfileClass(unittest.TestCase):
           pass
         self.fifo_obj.close()
     
-    self.fifo_obj = te.SharedFIFOfile(interval_len=0.01)
+    self.fifo_obj = te.fifo.SharedFIFOfile(interval_len=0.01)
     self.shutdown_EV = te.multiprocessing.Event()
     self.other_proc = TesterProc(self.fifo_obj,self.shutdown_EV)
     self.other_proc.start()
@@ -821,17 +826,17 @@ class TestSharedFIFOfileClass(unittest.TestCase):
         if self.other_proc.is_alive():
           self.other_proc.terminate()
     
-    if hasattr(te.SharedFIFOfile.TMPFILE,'writing_side_conn'):
-      te.SharedFIFOfile.TMPFILE.writing_side_conn.close()
-    if hasattr(te.SharedFIFOfile.TMPFILE,'reading_side_conn'):
-      te.SharedFIFOfile.TMPFILE.reading_side_conn.close()
+    if hasattr(te.fifo.SharedFIFOfile.TMPFILE,'writing_side_conn'):
+      te.fifo.SharedFIFOfile.TMPFILE.writing_side_conn.close()
+    if hasattr(te.fifo.SharedFIFOfile.TMPFILE,'reading_side_conn'):
+      te.fifo.SharedFIFOfile.TMPFILE.reading_side_conn.close()
 
 
 class TestSharedFIFOfileIntegration(unittest.TestCase):
   
   def setUp(self):
     reload(te)
-    self.fifo_obj = te.SharedFIFOfile(top_path=None,
+    self.fifo_obj = te.fifo.SharedFIFOfile(top_path=None,
                                       max_file_size_GB=1.7695128917694092e-08,
                                       size_check_delay=0,interval_len=0.01)
     self.shutdown_EV = te.multiprocessing.Event()

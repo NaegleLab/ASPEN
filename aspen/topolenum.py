@@ -12,7 +12,7 @@ import tarfile
 from cStringIO import StringIO
 from collections import defaultdict,namedtuple,Hashable
 from .tree import T_BASE,T
-from fifo import FIFOfile,SharedFIFOfile
+from . import fifo
 
 #===============================================================================
 # Topology assembly extension through branching
@@ -751,9 +751,9 @@ class AssemblyWorkspace(object):
   
   def push_to_fifo(self,push_these):
     if self.fifo is None:
-      self.fifo = FIFOfile()
+      self.fifo = fifo.FIFOfile()
     elif isinstance(self.fifo,str):
-      self.fifo = FIFOfile(name=self.fifo)
+      self.fifo = fifo.FIFOfile(name=self.fifo)
     for item in push_these:
       self.fifo.push(item)
   
@@ -1215,8 +1215,8 @@ class AssemblerProcess(multiprocessing.Process):
     self.results_queue.put('FINISHED')
   
   def run(self):
-    self.fifo = SharedFIFOfile(suffix='--'+self.name,
-                               max_file_size_GB=self.fifo_max_file_size)
+    self.fifo = fifo.SharedFIFOfile(suffix='--'+self.name,
+                                    max_file_size_GB=self.fifo_max_file_size)
     self.pass_to_workspace.kwargs['seed_assembly'] = self.seed_assembly
     self.assemblies = WorkerProcAssemblyWorkspace(self.fifo,self.queue,self.min_score,
                                                   self.encountered_assemblies_dict,
