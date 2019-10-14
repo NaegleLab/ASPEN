@@ -1,6 +1,6 @@
 from topolenum import *
 import subprocess
-from sys import float_info,stderr
+from sys import float_info,stderr,argv
 
 #===============================================================================
 # IO utils
@@ -181,15 +181,16 @@ def enumerate_topologies(leafdist_histograms,restart_from=None,
    
   return results
 
-if __name__ == '__main__':
+if __name__ == '__main__' and len(argv) > 1:
 #------------------------------------------------------------------------------
 # Arguments
 
-  pwhistfile = 'pwhist.txt'
+  pwhistfile = argv[1]
+  numproc = int(argv[2]) if len(argv) > 2 else 4
+  
   numtopologies = 1000
   restartfrom = None
   walltime = None
-  numproc = None
   savefilename = 'early_termination_save'
   timestampfreq = 30
   distconstraintfreq = 0.99
