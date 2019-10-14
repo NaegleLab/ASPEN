@@ -890,7 +890,7 @@ class WorkerProcAssemblyWorkspace(AssemblyWorkspace):
   
   def __init__(self,fifo,queue,min_score,shared_encountered_assemblies_dict,
                score_submission_queue,start_time_val,leaves_to_assemble,seed_assembly,
-               num_requested_trees,max_workspace_size,
+               num_requested_trees,max_workspace_size,monitor_activity=False,
                max_monitor_file_size=100*1024**2,**kwargs):
     encountered_assemblies = SharedCladeReprTracker(leaves_to_assemble,
                                             shared_encountered_assemblies_dict)
@@ -903,6 +903,7 @@ class WorkerProcAssemblyWorkspace(AssemblyWorkspace):
     self.score_submission_queue = score_submission_queue
     
     self.start_time = start_time_val
+    self._monitor_activity = monitor_activity
     self._max_monitor_file_size = max_monitor_file_size
     self._monitor_file_count = 1
     self.proc_name = multiprocessing.current_process().name
@@ -924,12 +925,20 @@ class WorkerProcAssemblyWorkspace(AssemblyWorkspace):
                            'w',0)
     return self._monitor
   
+  def close_monitor(self):
+    if hasattr(self,'_monitor'):
+      self._monitor.close()
+  
   @property
   def complete_trees_fh(self):
     if not hasattr(self,'_complete_trees_fh'):
       self._complete_trees_fh = open(multiprocessing.current_process().name+\
                                      '_complete_trees','w',0)
     return self._complete_trees_fh
+  
+  def close_complete_trees_fh(self):
+    if hasattr(self,'_complete_trees_fh'):
+      self._complete_trees_fh.close()
 
   @property
   def curr_min_score(self):
@@ -940,33 +949,34 @@ class WorkerProcAssemblyWorkspace(AssemblyWorkspace):
     return "%0.5f" % (time.time()-self.start_time.value)
   
   def log(self,message,assembly=None,proc_stamp=True,compressed=False,best_case=None):
-    currscore = self.curr_min_score
-    currscore = 'min_score='+repr(None) if currscore == -sys.float_info.max\
-                                           else "min_score=%0.5f" % currscore
-    iternum = "iter="+str(self.iternum)
-    pushcount = "push_count="+str(self.push_count)
-    topoffcount = "topoff_count="+str(self.topoff_count)
-    criterion = "criterion=%0.2f" % self.acceptance_criterion
-    if proc_stamp:
-      stamp = 'STAMP: '+'  '.join([multiprocessing.current_process().name,
-                                  'time='+self.time_stamp,currscore,iternum,
-                                  pushcount,topoffcount,criterion])+'   '
-    else:
-      stamp = 'STAMP: '+'  '.join(['time='+self.time_stamp,currscore,iternum,
-                                  pushcount,topoffcount,criterion])+'   '
-    if assembly is None:
-      print >>self.monitor,stamp,message
-    elif compressed:
-      print >>self.monitor,stamp,"\t%0.5f\t" % assembly[2],assembly[3],\
-                                 "\t%0.5f\t" % (assembly[2]/assembly[3]),\
-                                 message
-    else:
-      best_case = best_case or assembly.best_case
-      print >>self.monitor,stamp,"\t%0.5f\t" % best_case,\
-                                 assembly.nodes_left_to_build,\
-                                 "\t%0.5f\t" % assembly.sort_key,message,\
-                                 self.encountered_assemblies.make_str_repr(
-                                       assembly.current_clades_as_nested_sets)
+    if self._monitor_activity:
+      currscore = self.curr_min_score
+      currscore = 'min_score='+repr(None) if currscore == -sys.float_info.max\
+                                             else "min_score=%0.5f" % currscore
+      iternum = "iter="+str(self.iternum)
+      pushcount = "push_count="+str(self.push_count)
+      topoffcount = "topoff_count="+str(self.topoff_count)
+      criterion = "criterion=%0.2f" % self.acceptance_criterion
+      if proc_stamp:
+        stamp = 'STAMP: '+'  '.join([multiprocessing.current_process().name,
+                                    'time='+self.time_stamp,currscore,iternum,
+                                    pushcount,topoffcount,criterion])+'   '
+      else:
+        stamp = 'STAMP: '+'  '.join(['time='+self.time_stamp,currscore,iternum,
+                                    pushcount,topoffcount,criterion])+'   '
+      if assembly is None:
+        print >>self.monitor,stamp,message
+      elif compressed:
+        print >>self.monitor,stamp,"\t%0.5f\t" % assembly[2],assembly[3],\
+                                   "\t%0.5f\t" % (assembly[2]/assembly[3]),\
+                                   message
+      else:
+        best_case = best_case or assembly.best_case
+        print >>self.monitor,stamp,"\t%0.5f\t" % best_case,\
+                                   assembly.nodes_left_to_build,\
+                                   "\t%0.5f\t" % assembly.sort_key,message,\
+                                   self.encountered_assemblies.make_str_repr(
+                                         assembly.current_clades_as_nested_sets)
   
   def fill_workspace_from_fifo(self,max_size,rejected_assemblies,counter):
     no_reject = False
@@ -1009,7 +1019,8 @@ class WorkerProcAssemblyWorkspace(AssemblyWorkspace):
         self.log("CompleteAccepted",assembly)
         self.score_submission_queue.put(assembly.score)
         self.accepted_assemblies.append(assembly)
-        self.complete_trees_fh.write(str(assembly.score)+'\t'+assembly.built_clades[0].write('as_string','newick',plain=True))
+        if self._monitor_activity:
+          self.complete_trees_fh.write(str(assembly.score)+'\t'+assembly.built_clades[0].write('as_string','newick',plain=True))
       else:
         self.log("CompleteRejected",assembly)
         self.rejected_assemblies.append(assembly)
@@ -1023,20 +1034,23 @@ class WorkerProcAssemblyWorkspace(AssemblyWorkspace):
   
   def iterate(self,*args,**kwargs):
     try:
-      print >>self.monitor,'-'*80
-      print >>self.monitor,"START OF ITERATION",self.iternum,
-      print >>self.monitor,"\tworkspace size:",len(self.workspace),
-      print >>self.monitor,"\ttime:",self.time_stamp
+      if self._monitor_activity:
+        print >>self.monitor,'-'*80
+        print >>self.monitor,"START OF ITERATION",self.iternum,
+        print >>self.monitor,"\tworkspace size:",len(self.workspace),
+        print >>self.monitor,"\ttime:",self.time_stamp
       AssemblyWorkspace.iterate(self,*args,**kwargs)
     except self.AssemblyWorkFinished:
-      print >>self.monitor,"Caught 'FINISHED' signal"
+      if self._monitor_activity:
+        print >>self.monitor,"Caught 'FINISHED' signal"
       self.iternum += 1
       return 'FINISHED'
     finally:
-      print >>self.monitor,"END OF ITERATION",self.iternum-1,
-      print >>self.monitor,"\tworkspace size:",len(self.workspace),
-      print >>self.monitor,"\ttime:",self.time_stamp
-      print >>self.monitor,'-'*80
+      if self._monitor_activity:
+        print >>self.monitor,"END OF ITERATION",self.iternum-1,
+        print >>self.monitor,"\tworkspace size:",len(self.workspace),
+        print >>self.monitor,"\ttime:",self.time_stamp
+        print >>self.monitor,'-'*80
       gc.collect()
 
 
@@ -1250,8 +1264,8 @@ class AssemblerProcess(multiprocessing.Process):
             break
           else:
             continue
-      self.assemblies.monitor.close()
-      self.assemblies.complete_trees_fh.close()
+      self.assemblies.close_monitor()
+      self.assemblies.close_complete_trees_fh()
       self.close_fifo.set()
       self.fifo.close()
       self.queue_loader_p.join(timeout=15)
