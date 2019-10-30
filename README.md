@@ -21,7 +21,7 @@ Examples of path length distributions with short enumeration run times are provi
 
 1. Make sure `aspen` is in the PYTHONPATH
 2. Place pairwise path length distributions file in working directory
-3. Call `python -m aspen.run <`*`distributions file`*`> [`*`number of processes`*`]`
+3. Call `python -m aspen.run `*`distributions file`*` [`*`number of processes`*`]`
 
 Default number of processes to use for enumeration is 4.
 
