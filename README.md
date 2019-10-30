@@ -3,7 +3,7 @@
 ## Summary
 Topology reconstruction by enumeration using branch-and-bound, as described in the 2019 publication:
 
-`Sloutsky, R., & Naegle, K. M. (2019). ASPEN, a methodology for reconstructing protein evolution with improved accuracy using ensemble models. ELife, 8. doi:10.7554/eLife.4767`.
+`Sloutsky, R., & Naegle, K. M. (2019). ASPEN, a methodology for reconstructing protein evolution with improved accuracy using ensemble models. ELife, 8. doi:10.7554/eLife.47676`.
 
 ### Note about parallelization
 Although in some cases enumeration can be done effectively on one core, this code is set up for parallel reconstruction. Because there is some overhead to setting up the parallelization framework, this code actually runs less efficiently on one core. We recommend using at least 4 worker processes to take full advantage of the parallelization.
